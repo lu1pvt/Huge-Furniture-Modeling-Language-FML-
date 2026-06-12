@@ -1,0 +1,457 @@
+import FreeCAD
+import Part
+import os
+import csv
+import re
+import difflib
+from PySide2 import QtWidgets
+from datetime import datetime # Added for CMR timestamp
+
+# --- 1. SETUP & VARIABLES GLOBALES ---
+macro_path = os.path.dirname(os.path.realpath(__file__))
+BOM_BOARDS = []
+BOM_HARDWARE = []
+METROS_TAPACANTO = 0.0
+
+# --- 1.5 THE DETERMINISTIC FUZZY PARSER (Auto-Corrector) ---
+def auto_correct_fml(fml_text):
+    """
+    Fixes typos in the FML code using Fuzzy Logic (Levenshtein distance)
+    and restores broken formatting (like missing colons).
+    """
+    valid_keys = ['W', 'H', 'D', 'T', 'split', 'ratio', 'count', 'type',
+                  'door_style', 'drawer_style', 'handle', 'shelves',
+                  'gap', 'gap_top', 'gap_bottom', 'gap_left', 'gap_right']
+
+    valid_values = {
+        'split': ['horizontal', 'vertical'],
+        'type': ['drawers', 'doors', 'shelf', 'empty'],
+        'door_style': ['inset', 'overlay'],
+        'drawer_style': ['inset', 'overlay']
+    }
+
+    fixed_lines = []
+    
+    for line in fml_text.splitlines():
+        # Ignore empty lines or comments
+        if not line.strip() or line.strip().startswith('#'):
+            fixed_lines.append(line)
+            continue
+
+        # Match Key-Value pairs, allowing for missing colons and numbers in keys
+        match = re.match(r'^(\s*)([a-zA-Z0-9_]+)\s*:?\s*(.*)$', line)
+
+        if match:
+            indent, key, val = match.groups()
+
+            # --- KEY CORRECTION ---
+            # Do not attempt to fix dynamically generated node names like 'Space_1'
+            if key not in valid_keys and not key.startswith('Space_'):
+                matches = difflib.get_close_matches(key, valid_keys, n=1, cutoff=0.6)
+                if matches:
+                    FreeCAD.Console.PrintWarning(f"  [Auto-Fix] Key: '{key}' -> '{matches[0]}'\n")
+                    key = matches[0]
+
+            # --- VALUE CORRECTION ---
+            if key in valid_values and val:
+                clean_val = val.split('#')[0].strip()
+                if clean_val not in valid_values[key]:
+                    v_matches = difflib.get_close_matches(clean_val, valid_values[key], n=1, cutoff=0.6)
+                    if v_matches:
+                        FreeCAD.Console.PrintWarning(f"  [Auto-Fix] Value: '{clean_val}' -> '{v_matches[0]}'\n")
+                        val = val.replace(clean_val, v_matches[0])
+
+            # Reconstruct the line ensuring the colon is present
+            if val:
+                fixed_lines.append(f"{indent}{key}: {val}")
+            else:
+                fixed_lines.append(f"{indent}{key}:")
+        else:
+            fixed_lines.append(line)
+
+    return "\n".join(fixed_lines)
+
+# --- 2. THE INDENTATION PARSER (Lexer) ---
+def parse_fml(text):
+    root = {}
+    stack = [(-1, root)]
+    
+    for line in text.splitlines():
+        line = line.split('#')[0]
+        
+        if not line.strip(): 
+            continue
+            
+        indent = len(line) - len(line.lstrip())
+        key_val = line.strip().split(':', 1)
+        key = key_val[0].strip()
+        val = key_val[1].strip() if len(key_val) > 1 else ""
+        
+        while stack and stack[-1][0] >= indent: 
+            stack.pop()
+            
+        parent_dict = stack[-1][1]
+        
+        if val:
+            if val.startswith('['): 
+                val = [float(v.strip()) for v in val.strip('[]').split(',')]
+            else:
+                try: 
+                    val = float(val)
+                except ValueError: 
+                    pass
+            parent_dict[key] = val
+        else:
+            parent_dict[key] = {}
+            stack.append((indent, parent_dict[key]))
+            
+    return root
+
+# --- 3. FREE CAD DOCUMENT SETUP ---
+doc = FreeCAD.activeDocument()
+if doc is None: 
+    doc = FreeCAD.newDocument("FML_Engine")
+
+for obj in doc.Objects: 
+    doc.removeObject(obj.Name)
+
+def draw_board(name, l, w, h, x, y, z, color=(0.8, 0.7, 0.5)):
+    obj = doc.addObject("Part::Box", name)
+    obj.Length = l
+    obj.Width = w
+    obj.Height = h
+    obj.Placement = FreeCAD.Placement(FreeCAD.Vector(x, y, z), FreeCAD.Rotation(0,0,0,1))
+    obj.ViewObject.ShapeColor = color
+    
+    dims = sorted([l, w, h], reverse=True)
+    BOM_BOARDS.append([name, round(dims[0], 1), round(dims[1], 1), round(dims[2], 1)])
+    
+    return obj
+
+# --- 4. THE RECURSIVE ENGINE ---
+def process_volume(name, x, y, z, w, h, d, t, node):
+    global METROS_TAPACANTO
+    
+    # 1. HORIZONTAL SPLIT
+    if node.get('split') == 'horizontal':
+        if 'count' in node:
+            c = int(node.get('count', 1))
+            ratios = [1.0 / c] * c
+        else: 
+            ratios = node.get('ratio', [1.0])
+            
+        num_shelves = len(ratios) - 1
+        usable_h = h - (num_shelves * t)
+        
+        current_z = z
+        for i, ratio in enumerate(ratios):
+            space_h = usable_h * ratio
+            space_key = f"Space_{i+1}"
+            
+            if space_key in node: 
+                process_volume(f"{name}_{space_key}", x, y, current_z, w, space_h, d, t, node[space_key])
+                
+            current_z += space_h
+            if i < num_shelves:
+                draw_board(f"{name}_Structural_H_{i+1}", w, d, t, x, y, current_z, color=(0.9, 0.8, 0.6))
+                METROS_TAPACANTO += w 
+                current_z += t
+
+    # 2. VERTICAL SPLIT
+    elif node.get('split') == 'vertical':
+        if 'count' in node:
+            c = int(node.get('count', 1))
+            ratios = [1.0 / c] * c
+        else: 
+            ratios = node.get('ratio', [1.0])
+            
+        num_dividers = len(ratios) - 1
+        usable_w = w - (num_dividers * t)
+        
+        current_x = x
+        for i, ratio in enumerate(ratios):
+            space_w = usable_w * ratio
+            space_key = f"Space_{i+1}"
+            
+            if space_key in node: 
+                process_volume(f"{name}_{space_key}", current_x, y, z, space_w, h, d, t, node[space_key])
+                
+            current_x += space_w
+            if i < num_dividers:
+                draw_board(f"{name}_Structural_V_{i+1}", t, d, h, current_x, y, z, color=(0.9, 0.8, 0.6))
+                METROS_TAPACANTO += h 
+                current_x += t
+
+    # 3. COMPONENT LOGIC (Base Cases)
+    else:
+        obj_type = node.get('type', 'empty')
+        
+        gap = float(node.get('gap', 2.0))
+        gap_top = float(node.get('gap_top', gap))
+        gap_bottom = float(node.get('gap_bottom', gap))
+        gap_left = float(node.get('gap_left', gap))
+        gap_right = float(node.get('gap_right', gap))
+        
+        handle_type = node.get('handle', None)
+
+        if obj_type == 'doors':
+            door_style = node.get('door_style', 'inset')
+            # MODIFICACIÓN: Agregamos la lectura del count, por defecto 2 para mantener lógica previa
+            door_count = int(node.get('count', 2)) 
+            
+            if door_style == 'overlay':
+                dh = h + (2 * t) - gap_top - gap_bottom
+                pos_y = -t  
+                pos_z = z - t + gap_bottom
+                shelf_y_start = 2.0  
+                
+                if door_count == 1:
+                    dw = w + (2 * t) - gap_left - gap_right
+                    pos_x = x - t + gap_left
+                    draw_board(f"{name}_Door", dw, t, dh, pos_x, pos_y, pos_z, color=(0.2, 0.5, 0.9))
+                    METROS_TAPACANTO += (dw * 2) + (dh * 2)
+                else:
+                    dw = (w + (2 * t) - gap_left - gap_right - gap) / 2.0
+                    pos_x_l = x - t + gap_left
+                    pos_x_r = pos_x_l + dw + gap
+                    draw_board(f"{name}_Door_L", dw, t, dh, pos_x_l, pos_y, pos_z, color=(0.2, 0.5, 0.9))
+                    draw_board(f"{name}_Door_R", dw, t, dh, pos_x_r, pos_y, pos_z, color=(0.2, 0.5, 0.9))
+                    METROS_TAPACANTO += ((dw * 2) + (dh * 2)) * 2
+                    
+            else: # inset logic
+                dh = h - gap_top - gap_bottom
+                pos_y = 0
+                pos_z = z + gap_bottom
+                shelf_y_start = t + 2.0  
+                
+                if door_count == 1:
+                    dw = w - gap_left - gap_right
+                    pos_x = x + gap_left
+                    draw_board(f"{name}_Door", dw, t, dh, pos_x, pos_y, pos_z, color=(0.2, 0.5, 0.9))
+                    METROS_TAPACANTO += (dw * 2) + (dh * 2)
+                else:
+                    dw = (w - gap_left - gap_right - gap) / 2.0
+                    pos_x_l = x + gap_left
+                    pos_x_r = pos_x_l + dw + gap
+                    draw_board(f"{name}_Door_L", dw, t, dh, pos_x_l, pos_y, pos_z, color=(0.2, 0.5, 0.9))
+                    draw_board(f"{name}_Door_R", dw, t, dh, pos_x_r, pos_y, pos_z, color=(0.2, 0.5, 0.9))
+                    METROS_TAPACANTO += ((dw * 2) + (dh * 2)) * 2
+
+            # MODIFICACIÓN: Calculamos las bisagras y tiradores multiplicando por la cantidad de puertas
+            hinges = (2 + int(dh // 800)) * door_count
+            BOM_HARDWARE.append([f"Bisagras ({door_style}) p/ {name}", hinges])
+            
+            if handle_type:
+                BOM_HARDWARE.append([f"Tirador ({handle_type}) p/ {name}", door_count])
+
+            internal_shelves = int(node.get('shelves', 0))
+            if internal_shelves > 0:
+                shelf_usable_h = h - (internal_shelves * t)
+                shelf_h_spacing = shelf_usable_h / (internal_shelves + 1)
+                shelf_d = d - shelf_y_start - 5.0 
+                
+                for i in range(internal_shelves):
+                    shelf_z = z + (shelf_h_spacing * (i+1)) + (t * i)
+                    draw_board(f"{name}_InsideShelf_{i+1}", w, shelf_d, t, x, shelf_y_start, shelf_z, color=(0.5, 0.5, 0.5))
+                    METROS_TAPACANTO += w 
+
+        elif obj_type == 'drawers':
+            drawer_style = node.get('drawer_style', 'inset')
+            qty = int(node.get('count', 1))
+            d_gap = 3.0
+            inner_d_h = (h - (d_gap * (qty + 1))) / qty
+            
+            slide_gap = 13.0
+            int_w = w - (slide_gap * 2)
+            int_h = inner_d_h - 30.0
+            int_d = d - 50.0
+            
+            for i in range(qty):
+                if drawer_style == 'overlay':
+                    front_w = w + (2 * t) - gap_left - gap_right
+                    H_total = h + (2 * t) - gap_top - gap_bottom
+                    front_h = (H_total - ((qty - 1) * d_gap)) / qty
+                    pos_x = x - t + gap_left
+                    pos_y = -t
+                    pos_z = (z - t) + gap_bottom + (i * (front_h + d_gap))
+                    int_y = 2.0 
+                else:
+                    front_w = w - gap_left - gap_right
+                    front_h = inner_d_h
+                    pos_x = x + gap_left
+                    pos_y = 0
+                    pos_z = z + gap_bottom + (i * (front_h + d_gap))
+                    int_y = t + 2.0 
+                
+                draw_board(f"{name}_Front_{i+1}", front_w, t, front_h, pos_x, pos_y, pos_z, color=(0.7, 0.3, 0.3))
+                METROS_TAPACANTO += ((front_w * 2) + (front_h * 2))
+                
+                inner_z_base = z + d_gap + (i * (inner_d_h + d_gap))
+                int_z = inner_z_base + 15
+                
+                draw_board(f"{name}_BoxL_{i+1}", t, int_d, int_h, x + slide_gap, int_y, int_z, color=(0.85, 0.75, 0.6))
+                draw_board(f"{name}_BoxR_{i+1}", t, int_d, int_h, x + w - slide_gap - t, int_y, int_z, color=(0.85, 0.75, 0.6))
+                draw_board(f"{name}_BoxF_{i+1}", int_w - (2*t), t, int_h, x + slide_gap + t, int_y, int_z, color=(0.85, 0.75, 0.6))
+                draw_board(f"{name}_BoxB_{i+1}", int_w - (2*t), t, int_h, x + slide_gap + t, int_y + int_d - t, int_z, color=(0.85, 0.75, 0.6))
+                draw_board(f"{name}_BoxBottom_{i+1}", int_w, int_d, 6.0, x + slide_gap, int_y, int_z - 6.0, color=(0.9, 0.85, 0.7))
+                
+                BOM_HARDWARE.append([f"Guias Telescopicas {int(int_d)}mm p/ Cajon {i+1}", 1])
+                
+                if handle_type: 
+                    BOM_HARDWARE.append([f"Tirador ({handle_type}) p/ Cajon {i+1}", 1])
+
+        elif obj_type == 'shelf':
+            draw_board(f"{name}_IntShelf", w, d, t, x, y, z + (h/2) - (t/2), color=(0.5, 0.5, 0.5))
+            METROS_TAPACANTO += w 
+
+# --- 5. COMPILER EXECUTION ---
+def compile_fml():
+    global BOM_BOARDS, BOM_HARDWARE, METROS_TAPACANTO
+    
+    BOM_BOARDS = []
+    BOM_HARDWARE = []
+    METROS_TAPACANTO = 0.0
+    
+    fml_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        None, 
+        "Seleccionar archivo FML", 
+        macro_path, 
+        "FML Files (*.fml);;All Files (*)"
+    )
+    
+    if not fml_path: 
+        return
+        
+    csv_path = os.path.splitext(fml_path)[0] + "_BOM.csv"
+    cmr_path = os.path.splitext(fml_path)[0] + ".cmr" # Output path for CutMaster file
+
+    try:
+        with open(fml_path, 'r', encoding='utf-8') as file: 
+            raw_fml_text = file.read()
+            
+        # --- DETERMINISTIC AUTO-CORRECTION PASS ---
+        FreeCAD.Console.PrintMessage("INFO: Running FML through Fuzzy Logic Auto-Corrector...\n")
+        clean_fml_text = auto_correct_fml(raw_fml_text)
+        
+        # Parse the clean text into AST
+        ast = parse_fml(clean_fml_text)
+        
+    except Exception as e: 
+        FreeCAD.Console.PrintError(f"Error opening/parsing FML: {e}\n")
+        return
+        
+    W = ast.get('W', 1000)
+    H = ast.get('H', 1000)
+    D = ast.get('D', 600)
+    T = ast.get('T', 18)
+
+    draw_board("Left_Side", T, D, H, 0, 0, 0)
+    draw_board("Right_Side", T, D, H, W - T, 0, 0)
+    draw_board("Bottom_Panel", W - (2 * T), D, T, T, 0, 0)
+    draw_board("Top_Panel", W - (2 * T), D, T, T, 0, H - T)
+    
+    METROS_TAPACANTO += (H * 2) + ((W - (2 * T)) * 2)
+    
+    inner_w = W - (2 * T)
+    inner_h = H - (2 * T)
+    
+    process_volume("Mueble", T, 0, T, inner_w, inner_h, D, T, ast)
+
+    doc.recompute()
+    FreeCAD.Gui.SendMsgToActiveView("ViewFit")
+    
+    # 5.1 Generate CSV
+    try:
+        with open(csv_path, mode='w', newline='') as file:
+            writer = csv.writer(file, delimiter=';')
+            
+            writer.writerow(["--- LISTA DE CORTES ---"])
+            writer.writerow(["Pieza", "Largo", "Ancho", "Espesor"])
+            for row in BOM_BOARDS: 
+                writer.writerow(row)
+                
+            writer.writerow([])
+            writer.writerow(["--- INSUMOS EXTRAS ---"])
+            writer.writerow(["Tapacantos (Metros Lineales)", round(METROS_TAPACANTO / 1000, 2)])
+            
+            writer.writerow([])
+            writer.writerow(["--- HERRAJES ---"])
+            for hw in BOM_HARDWARE: 
+                writer.writerow(hw)
+                
+        FreeCAD.Console.PrintMessage(f"Éxito: Lista CSV generada en: {csv_path}\n")
+        
+    except Exception as e: 
+        FreeCAD.Console.PrintError(f"Error generando CSV: {e}\n")
+
+    # 5.2 Generate CMR (CutMaster 2D) using BOM_BOARDS data directly
+    try:
+        partes_xml = []
+        contador_partes = 0
+        
+        # Parse data directly from memory list instead of reading the CSV file
+        for board in BOM_BOARDS:
+            etiqueta = str(board[0])[:15].rstrip('_')
+            largo = str(int(board[1]))
+            ancho = str(int(board[2]))
+            
+            xml_nodo = f'        <part><len>{largo}</len><wid>{ancho}</wid><qty>1</qty><ini>{etiqueta}</ini><rot>0</rot><bl1 val="-" th="0" sg=""/><bl2 val="-" th="0" sg=""/><bw1 val="-" th="0" sg=""/><bw2 val="-" th="0" sg=""/></part>'
+            partes_xml.append(xml_nodo)
+            contador_partes += 1
+
+        if contador_partes > 0:
+            fecha_hora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+            with open(cmr_path, 'w', encoding='utf-8', newline='\r\n') as f_cmr:
+                f_cmr.write('<?xml version="1.0" encoding="UTF-8" ?>\n')
+                f_cmr.write('<cm2d_root xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n')
+                f_cmr.write('  <version>1.3</version>\n')
+                f_cmr.write('  <type>Pro</type>\n')
+                f_cmr.write('  <author></author>\n')
+                f_cmr.write('  <company></company>\n')
+                f_cmr.write(f'  <date_time>{fecha_hora}</date_time>\n')
+                f_cmr.write('  <job>\n')
+                f_cmr.write('    <measure>0</measure>\n')
+                f_cmr.write('    <cover_title>Importacion FML</cover_title>\n')
+                f_cmr.write('    <client_name></client_name>\n')
+                f_cmr.write('    <client_surname></client_surname>\n')
+                f_cmr.write('    <client_address></client_address>\n')
+                f_cmr.write('    <client_phone></client_phone>\n')
+                f_cmr.write('    <client_note></client_note>\n')
+                f_cmr.write('    <price1>0</price1>\n')
+                f_cmr.write('    <price2>0</price2>\n')
+                f_cmr.write('    <price3>0</price3>\n')
+                f_cmr.write('    <data>\n')
+                f_cmr.write('      <stats>\n')
+                f_cmr.write('        <parts>0</parts>\n')
+                f_cmr.write('        <used_parts>0</used_parts>\n')
+                f_cmr.write('        <used_sheets>0</used_sheets>\n')
+                f_cmr.write('        <part_area>0</part_area>\n')
+                f_cmr.write('        <average_yield>0</average_yield>\n')
+                f_cmr.write('        <last_sheet_yield>0</last_sheet_yield>\n')
+                f_cmr.write('        <cut_length>0</cut_length>\n')
+                f_cmr.write('        <banding_length>0</banding_length>\n')
+                f_cmr.write('      </stats>\n')
+                f_cmr.write('      <tab_sheets count="1">\n')
+                f_cmr.write('        <sheet><len>2750</len><wid>1830</wid><qty>10</qty><descr>Melamina</descr></sheet>\n')
+                f_cmr.write('      </tab_sheets>\n')
+                f_cmr.write(f'      <tab_parts count="{contador_partes}">\n')
+                
+                for px in partes_xml:
+                    f_cmr.write(f'{px}\n')
+                    
+                f_cmr.write('      </tab_parts>\n')
+                f_cmr.write('      <diagrams>\n')
+                f_cmr.write('        <elements count="0" />\n')
+                f_cmr.write('        <offcuts count="0" />\n')
+                f_cmr.write('      </diagrams>\n')
+                f_cmr.write('    </data>\n')
+                f_cmr.write('  </job>\n')
+                f_cmr.write('</cm2d_root>\n')
+                
+            FreeCAD.Console.PrintMessage(f"Éxito: Lista CMR generada en: {cmr_path}\n")
+
+    except Exception as e:
+        FreeCAD.Console.PrintError(f"Error generando CMR: {e}\n")
+
+compile_fml()

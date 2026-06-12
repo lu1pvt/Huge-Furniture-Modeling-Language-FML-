@@ -1,0 +1,52 @@
+# Parámetros Globales
+W: 1000
+H: 800
+D: 280
+T: 18
+
+# División Principal Horizontal
+split: horizontal
+ratio: [0.4, 0.6]
+
+# --- SECCIÓN INFERIOR ---
+Space_1:
+    split: vertical
+    ratio: [0.4, 0.6]
+    
+    # Lado Izquierdo: Impresora Negra (40%)
+    Space_1:
+        type: empty
+        
+    # Lado Derecho: Impresora Blanca + Cajones (60%)
+    Space_2:
+        type: drawers
+        drawer_style: overlay
+        count: 2
+        handle: tirador_madera_redondo
+        gap: 3.0
+        gap_top: 11.0
+        gap_left: 11.0
+   
+
+# --- SECCIÓN SUPERIOR (Alacena) ---
+Space_2:
+    split: vertical
+    count: 2
+    
+    Space_1:
+        type: doors
+        door_style: overlay
+        handle: tirador_madera_redondo
+        gap: 2.0
+        gap_bottom: 11.0
+        gap_right: 11.0
+        shelves: 1
+        
+    Space_2:
+        type: doors
+        door_style: overlay
+        handle: tirador_madera_redondo
+        gap: 2.0
+        gap_bottom: 11.0
+        gap_left: 11.0
+        shelves: 1
