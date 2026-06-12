@@ -9,8 +9,11 @@ FML is a lightweight, indentation-driven declarative language designed to map co
 * **Declarative Volumetric Splitting:** Easily divide spaces horizontally or vertically using mathematical ratios (`split` & `ratio`).
 * **Parametric Components:** Native support for rendering `doors`, `drawers`, and `empty` structural niches.
 * **Hardware & Clearance Control:** Granular control over edge gaps (`gap_top`, `gap_bottom`, etc.) and hardware assignments (`handle`).
-* **Headless Compilation:** Designed to run via CLI (`FreeCADCmd`) without the FreeCAD GUI, outputting 3D structures and Cutlist Material Reports (CMR / BOM).
+* **Headless Compilation:** Designed to run via CLI (`FreeCADCmd`) without the FreeCAD GUI, outputting 3D structures and Cutlist Material Reports (CMR *
+* **Automated CAM Exports:** * Generates `bom.csv`: A comprehensive Bill of Materials for parts, edge-banding tracking, and hardware procurement.
+* Generates `*.cmr`: Native XML project exports built specifically for immediate optimization workflows inside **CutMaster** / **Cutlist Plus**./ BOM).
 * **LLM-Friendly Syntax:** Strict indentation rules and isolated parameter blocks make it highly reliable for AI-driven code generation.
+* 
 
 ## 📂 Repository Structure
 * `FML_Compiler_VF_CMR.FCMacro`: The core Python lexer, parser, and 3D generator macro for FreeCAD.
